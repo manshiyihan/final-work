@@ -150,7 +150,7 @@ curl -X POST "http://127.0.0.1:8000/api/verify" \
 | 指标 | 数值 |
 |------|------|
 | MFA Conformer EER | 0.72% |
-| RawGAT-ST 准确率 | ~95% |
+| RawGAT-ST 准确率 | ~70% |
 | 单次推理延迟 | ~1-2s (CPU) / ~200ms (GPU) |
 
 ## 致谢

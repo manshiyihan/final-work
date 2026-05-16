@@ -1,8 +1,0 @@
-{
-  "users": {
-    "admin": {
-      "salt": "f262a0ff1c14b913c990fa64868b909b",
-      "password_hash": "46ad13d207e8ec8bc26f9a5833bfd9a95f14f3778776b3ef7ccfdbb6f9867fbf"
-    }
-  }
-}
