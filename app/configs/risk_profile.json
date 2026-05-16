@@ -1,0 +1,16 @@
+{
+  "rules": {
+    "spoof_label_values": [
+      "spoof"
+    ],
+    "unknown_speaker_values": [
+      "unknown",
+      "未知"
+    ]
+  },
+  "scores": {
+    "fraud_risk": 0.9,
+    "identity_unknown": 0.7,
+    "pass": 0.1
+  }
+}

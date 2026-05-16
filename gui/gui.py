@@ -1,11 +1,15 @@
 import subprocess
 import os
 import tempfile
+import json
+import mimetypes
+import csv
 import gradio as gr
 from pathlib import Path
 import soundfile as sf
 import librosa
 import numpy as np
+from urllib import error, request
 
 # 模型路径配置
 # 仓库根目录：gui/gui.py -> comb_model/
@@ -17,9 +21,254 @@ MFA_FAISS_DIR = BASE_DIR / "mfa_conformer_sv" / "faiss"
 RAWGAT_MODEL = str(BASE_DIR / "RawGAT-ST-antispoofing-main" / "epoch_42.pth")
 RAWGAT_INFERENCE_SCRIPT = str(BASE_DIR / "RawGAT-ST-antispoofing-main" / "inference.py")
 RAWGAT_CONFIG = str(BASE_DIR / "RawGAT-ST-antispoofing-main" / "model_config_RawGAT_ST.yaml")
+API_BASE_URL = os.getenv("COMB_API_BASE_URL", "http://127.0.0.1:8000")
 
 # 确保faiss目录存在
 MFA_FAISS_DIR.mkdir(parents=True, exist_ok=True)
+
+# 打印路径用于调试
+print(f"BASE_DIR: {BASE_DIR}")
+print(f"RAWGAT_CONFIG: {RAWGAT_CONFIG}")
+print(f"RAWGAT_CONFIG exists: {os.path.exists(RAWGAT_CONFIG)}")
+
+
+def build_multipart_form_data(fields, files):
+    boundary = "----CombModelBoundary7MA4YWxkTrZu0gW"
+    lines = []
+    for name, value in fields.items():
+        lines.extend(
+            [
+                f"--{boundary}",
+                f'Content-Disposition: form-data; name="{name}"',
+                "",
+                str(value),
+            ]
+        )
+    for name, file_path in files.items():
+        filename = os.path.basename(file_path)
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        with open(file_path, "rb") as file:
+            file_data = file.read()
+        lines.extend(
+            [
+                f"--{boundary}",
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"',
+                f"Content-Type: {content_type}",
+                "",
+            ]
+        )
+        lines.append(file_data)
+    lines.append(f"--{boundary}--")
+    lines.append("")
+
+    body = b""
+    for line in lines:
+        if isinstance(line, bytes):
+            body += line + b"\r\n"
+        else:
+            body += line.encode("utf-8") + b"\r\n"
+
+    return body, boundary
+
+
+def post_audio_api(endpoint, audio_path, extra_fields=None):
+    extra_fields = extra_fields or {}
+    body, boundary = build_multipart_form_data(extra_fields, {"audio": audio_path})
+    req = request.Request(
+        f"{API_BASE_URL}{endpoint}",
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return True, data
+    except error.URLError as exc:
+        return False, f"API请求失败: {exc}"
+    except Exception as exc:
+        return False, f"API响应异常: {exc}"
+
+
+def get_json_api(endpoint):
+    req = request.Request(f"{API_BASE_URL}{endpoint}", method="GET")
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return True, data
+    except error.URLError as exc:
+        return False, f"API请求失败: {exc}"
+    except Exception as exc:
+        return False, f"API响应异常: {exc}"
+
+
+def fetch_history_records(page, final_label, input_type, limit=10):
+    label = "" if final_label == "all" else final_label
+    source = "" if input_type == "all" else input_type
+    endpoint = (
+        f"/api/records/query?limit={int(limit)}&page={int(page)}"
+        f"&final_label={label}&input_type={source}"
+    )
+    ok, resp = get_json_api(endpoint)
+    if not ok:
+        return f"❌ 获取历史记录失败：{resp}", []
+
+    if not resp.get("ok"):
+        return f"❌ 获取历史记录失败：{resp.get('error', '未知错误')}", []
+
+    items = resp.get("items", [])
+    pager = resp.get("pagination", {})
+    summary = (
+        f"✅ 共 {pager.get('total', 0)} 条记录，"
+        f"当前第 {pager.get('page', 1)} 页，每页 {pager.get('limit', limit)} 条"
+    )
+    table_rows = []
+    for item in items:
+        table_rows.append(
+            [
+                item.get("id"),
+                item.get("created_at", ""),
+                item.get("input_type", ""),
+                item.get("final_label", ""),
+                item.get("risk_score", ""),
+                item.get("latency_ms", ""),
+                item.get("speaker_result", ""),
+                item.get("spoof_result", ""),
+            ]
+        )
+    return summary, table_rows
+
+
+def export_history_csv(page, final_label, input_type, limit=200):
+    label = "" if final_label == "all" else final_label
+    source = "" if input_type == "all" else input_type
+    endpoint = (
+        f"/api/records/query?limit={int(limit)}&page={int(page)}"
+        f"&final_label={label}&input_type={source}"
+    )
+    ok, resp = get_json_api(endpoint)
+    if not ok:
+        return None, f"❌ 导出失败：{resp}"
+    if not resp.get("ok"):
+        return None, f"❌ 导出失败：{resp.get('error', '未知错误')}"
+
+    items = resp.get("items", [])
+    return _write_history_csv(items), f"✅ 导出成功，共 {len(items)} 条，已生成 CSV 文件"
+
+
+def _write_history_csv(items):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", newline="", encoding="utf-8") as tmp:
+        writer = csv.writer(tmp)
+        writer.writerow(
+            [
+                "id",
+                "created_at",
+                "input_type",
+                "final_label",
+                "risk_score",
+                "latency_ms",
+                "speaker_name",
+                "spoof_result",
+                "audio_path",
+                "audio_hash",
+            ]
+        )
+        for item in items:
+            writer.writerow(
+                [
+                    item.get("id", ""),
+                    item.get("created_at", ""),
+                    item.get("input_type", ""),
+                    item.get("final_label", ""),
+                    item.get("risk_score", ""),
+                    item.get("latency_ms", ""),
+                    item.get("speaker_result", ""),
+                    item.get("spoof_result", ""),
+                    item.get("audio_path", ""),
+                    item.get("audio_hash", ""),
+                ]
+            )
+        file_path = tmp.name
+    return file_path
+
+
+def export_all_history_csv(final_label, input_type, page_size=200):
+    label = "" if final_label == "all" else final_label
+    source = "" if input_type == "all" else input_type
+
+    first_endpoint = (
+        f"/api/records/query?limit={int(page_size)}&page=1"
+        f"&final_label={label}&input_type={source}"
+    )
+    ok, first_resp = get_json_api(first_endpoint)
+    if not ok:
+        return None, f"❌ 全量导出失败：{first_resp}"
+    if not first_resp.get("ok"):
+        return None, f"❌ 全量导出失败：{first_resp.get('error', '未知错误')}"
+
+    pagination = first_resp.get("pagination", {})
+    total = int(pagination.get("total", 0))
+    if total == 0:
+        return None, "⚠️ 当前筛选条件下没有可导出的记录"
+
+    all_items = list(first_resp.get("items", []))
+    total_pages = (total + int(page_size) - 1) // int(page_size)
+    for page in range(2, total_pages + 1):
+        endpoint = (
+            f"/api/records/query?limit={int(page_size)}&page={page}"
+            f"&final_label={label}&input_type={source}"
+        )
+        ok, resp = get_json_api(endpoint)
+        if not ok or not resp.get("ok"):
+            return None, f"❌ 全量导出失败：第 {page} 页请求异常"
+        all_items.extend(resp.get("items", []))
+
+    file_path = _write_history_csv(all_items)
+    return file_path, f"✅ 全量导出成功，共 {len(all_items)} 条，已生成 CSV 文件"
+
+
+def _to_status_text(final_label):
+    if final_label == "pass":
+        return "✅ 通过"
+    if final_label == "fraud_risk":
+        return "🚨 疑似欺诈"
+    if final_label == "identity_unknown":
+        return "⚠️ 身份未知"
+    return "❓ 待确认"
+
+
+def _extract_speaker_name_for_ui(mfa_result):
+    text = (mfa_result or "").strip()
+    if not text:
+        return "未知"
+    if "匹配人员" in text:
+        parts = text.replace("：", ":").split(":", 1)
+        if len(parts) == 2 and parts[1].strip():
+            return parts[1].strip()
+    if "不在库中" in text:
+        return "未知"
+    return text.splitlines()[0].strip() if text else "未知"
+
+
+def _extract_spoof_result_for_ui(rawgat_result):
+    text = (rawgat_result or "").strip().lower()
+    if any(token in text for token in ["虚假", "spoof", "fake"]):
+        return "伪造语音"
+    if any(token in text for token in ["真实", "bonafide", "real"]):
+        return "真实语音"
+    return "未知"
+
+
+def _build_simple_result_text(status, speaker_name, spoof_text, risk_score, latency_ms, current_time, mode_label):
+    return f"""
+## {status}
+
+- 说话人: **{speaker_name}**
+- 反欺诈: **{spoof_text}**
+- 风险分数: **{risk_score}** | 耗时: **{latency_ms} ms**
+
+`{mode_label}` · `{current_time}`
+"""
 
 
 def run_mfa_conformer_inference(audio_path):
@@ -124,27 +373,36 @@ def process_audio_file(audio_file):
         return "错误: 音频文件不存在", "", ""
     
     try:
-        # 运行两个模型
-        mfa_result, mfa_status = run_mfa_conformer_inference(audio_path)
-        rawgat_result, rawgat_status = run_rawgat_st_inference(audio_path)
-        
-        # 格式化结果
+        api_ok, api_result = post_audio_api("/api/verify", audio_path, {"input_type": "upload"})
+        if api_ok and api_result.get("ok"):
+            from datetime import datetime
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            mfa_result = api_result.get("mfa_result", "")
+            rawgat_result = api_result.get("rawgat_result", "")
+            final_label = api_result.get("final_label", "unknown")
+            risk_score = api_result.get("risk_score", "N/A")
+            latency_ms = api_result.get("latency_ms", "N/A")
+            status = _to_status_text(final_label)
+            speaker_name = api_result.get("speaker_result", "未知")
+            spoof_text = "伪造语音" if api_result.get("spoof_result") == "spoof" else "真实语音"
+            result_text = _build_simple_result_text(
+                status, speaker_name, spoof_text, risk_score, latency_ms, current_time, "API模式"
+            )
+            return result_text, mfa_result, rawgat_result
+
+        # API不可用时，回退到本地推理
+        mfa_result, _ = run_mfa_conformer_inference(audio_path)
+        rawgat_result, _ = run_rawgat_st_inference(audio_path)
+
         from datetime import datetime
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        result_text = f"""
-## 📊 检测结果
-
-### 🎤 说话人验证结果
-{mfa_result}
-
-### 🛡️ 反欺骗检测结果
-{rawgat_result}
-
----
-*检测完成时间: {current_time}*
-"""
-        
+        speaker_name = _extract_speaker_name_for_ui(mfa_result)
+        spoof_text = _extract_spoof_result_for_ui(rawgat_result)
+        status = "🚨 疑似欺诈" if spoof_text == "伪造语音" else ("⚠️ 身份未知" if speaker_name == "未知" else "✅ 通过")
+        risk_score = "0.9" if spoof_text == "伪造语音" else ("0.7" if speaker_name == "未知" else "0.1")
+        result_text = _build_simple_result_text(
+            status, speaker_name, spoof_text, risk_score, "N/A", current_time, "本地模式"
+        )
         return result_text, mfa_result, rawgat_result
     except Exception as e:
         return f"错误: {str(e)}", "", ""
@@ -190,27 +448,35 @@ def process_recorded_audio(audio):
         if not success:
             return f"错误: 音频格式转换失败 - {error_msg}", "", ""
         
-        # 使用转换后的音频文件运行两个模型
-        mfa_result, mfa_status = run_mfa_conformer_inference(temp_audio_path)
-        rawgat_result, rawgat_status = run_rawgat_st_inference(temp_audio_path)
-        
-        # 格式化结果
+        api_ok, api_result = post_audio_api("/api/verify", temp_audio_path, {"input_type": "record"})
+        if api_ok and api_result.get("ok"):
+            from datetime import datetime
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            mfa_result = api_result.get("mfa_result", "")
+            rawgat_result = api_result.get("rawgat_result", "")
+            final_label = api_result.get("final_label", "unknown")
+            risk_score = api_result.get("risk_score", "N/A")
+            latency_ms = api_result.get("latency_ms", "N/A")
+            status = _to_status_text(final_label)
+            speaker_name = api_result.get("speaker_result", "未知")
+            spoof_text = "伪造语音" if api_result.get("spoof_result") == "spoof" else "真实语音"
+            result_text = _build_simple_result_text(
+                status, speaker_name, spoof_text, risk_score, latency_ms, current_time, "API模式"
+            )
+            return result_text, mfa_result, rawgat_result
+
+        # API不可用时，回退到本地推理
+        mfa_result, _ = run_mfa_conformer_inference(temp_audio_path)
+        rawgat_result, _ = run_rawgat_st_inference(temp_audio_path)
         from datetime import datetime
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        result_text = f"""
-## 📊 检测结果
-
-### 🎤 说话人验证结果
-{mfa_result}
-
-### 🛡️ 反欺骗检测结果
-{rawgat_result}
-
----
-*检测完成时间: {current_time}*
-"""
-        
+        speaker_name = _extract_speaker_name_for_ui(mfa_result)
+        spoof_text = _extract_spoof_result_for_ui(rawgat_result)
+        status = "🚨 疑似欺诈" if spoof_text == "伪造语音" else ("⚠️ 身份未知" if speaker_name == "未知" else "✅ 通过")
+        risk_score = "0.9" if spoof_text == "伪造语音" else ("0.7" if speaker_name == "未知" else "0.1")
+        result_text = _build_simple_result_text(
+            status, speaker_name, spoof_text, risk_score, "N/A", current_time, "本地模式"
+        )
         return result_text, mfa_result, rawgat_result
     except Exception as e:
         return f"错误: {str(e)}", "", ""
@@ -389,9 +655,16 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
                     if not success:
                         return f"错误: 音频格式转换失败 - {error_msg}", ""
                     
-                    # 注册说话人
-                    result, status = register_speaker(temp_audio_path, speaker_name)
-                    
+                    api_ok, api_result = post_audio_api(
+                        "/api/register",
+                        temp_audio_path,
+                        {"speaker_name": speaker_name},
+                    )
+                    if api_ok and api_result.get("ok"):
+                        return f"✅ 注册成功: {api_result.get('speaker_name', speaker_name)}", ""
+
+                    # API不可用时，回退到本地注册
+                    result, _ = register_speaker(temp_audio_path, speaker_name)
                     return result, ""
                 except Exception as e:
                     return f"错误: {str(e)}", ""
@@ -482,9 +755,16 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
                             return f"错误: 音频格式转换失败 - {error_msg}", ""
                         audio_path = temp_audio_path
                     
-                    # 注册说话人
-                    result, status = register_speaker(audio_path, speaker_name)
-                    
+                    api_ok, api_result = post_audio_api(
+                        "/api/register",
+                        audio_path,
+                        {"speaker_name": speaker_name},
+                    )
+                    if api_ok and api_result.get("ok"):
+                        return f"✅ 注册成功: {api_result.get('speaker_name', speaker_name)}", ""
+
+                    # API不可用时，回退到本地注册
+                    result, _ = register_speaker(audio_path, speaker_name)
                     return result, ""
                 except Exception as e:
                     return f"错误: {str(e)}", ""
@@ -500,6 +780,61 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
                 fn=process_register_file,
                 inputs=[register_file_input, register_file_name],
                 outputs=[register_file_result, register_file_name]
+            )
+
+        # 模式5: 历史记录查询
+        with gr.Tab("历史记录", id="history_tab"):
+            gr.Markdown("### 查询检测历史记录（来自后端数据库）")
+            with gr.Row():
+                history_page = gr.Number(label="页码", value=1, precision=0)
+                history_label = gr.Dropdown(
+                    label="最终标签过滤",
+                    choices=["all", "pass", "fraud_risk", "identity_unknown"],
+                    value="all",
+                )
+                history_input_type = gr.Dropdown(
+                    label="输入类型过滤",
+                    choices=["all", "upload", "record"],
+                    value="all",
+                )
+                history_refresh_btn = gr.Button("刷新记录", variant="primary")
+                history_export_btn = gr.Button("导出当前筛选CSV")
+                history_export_all_btn = gr.Button("导出全部筛选CSV")
+
+            history_summary = gr.Textbox(label="查询摘要", interactive=False)
+            history_table = gr.Dataframe(
+                headers=[
+                    "ID",
+                    "时间",
+                    "输入类型",
+                    "最终标签",
+                    "风险分数",
+                    "耗时(ms)",
+                    "说话人姓名",
+                    "反欺诈结果",
+                ],
+                datatype=["number", "str", "str", "str", "number", "number", "str", "str"],
+                interactive=False,
+                row_count=10,
+                col_count=(8, "fixed"),
+            )
+            history_export_file = gr.File(label="CSV下载", interactive=False)
+            history_export_status = gr.Textbox(label="导出状态", interactive=False)
+
+            history_refresh_btn.click(
+                fn=fetch_history_records,
+                inputs=[history_page, history_label, history_input_type],
+                outputs=[history_summary, history_table],
+            )
+            history_export_btn.click(
+                fn=export_history_csv,
+                inputs=[history_page, history_label, history_input_type],
+                outputs=[history_export_file, history_export_status],
+            )
+            history_export_all_btn.click(
+                fn=export_all_history_csv,
+                inputs=[history_label, history_input_type],
+                outputs=[history_export_file, history_export_status],
             )
     
     gr.Markdown("""

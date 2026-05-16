@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from pathlib import Path
 import soundfile as sf
@@ -72,6 +73,7 @@ if __name__ == '__main__':
     parser.add_argument('--audio_path', type=str, required=True, help='待预测音频文件路径')
     parser.add_argument('--model_path', type=str, default=str(BASE_DIR / "epoch_42.pth"), help='模型检查点路径')
     parser.add_argument('--model_config', type=str, default=str(BASE_DIR / "model_config_RawGAT_ST.yaml"), help='模型配置文件路径')
+    parser.add_argument('--json_output', action='store_true', help='输出JSON格式结果')
 
     # 解析命令行参数
     args = parser.parse_args()
@@ -94,4 +96,16 @@ if __name__ == '__main__':
     prediction = predict_audio(args.audio_path, model, device)
 
     # 输出预测结果
+    if args.json_output:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "label": "bonafide" if prediction == 1 else "spoof",
+                    "label_zh": "真实" if prediction == 1 else "虚假",
+                    "prediction": int(prediction),
+                },
+                ensure_ascii=False,
+            )
+        )
     print("判断结果:", "真实" if prediction == 1 else "虚假")
